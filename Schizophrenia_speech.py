@@ -1,12 +1,12 @@
 # ===============================
-# 1⍡ Mount Google Drive
+# 1║ Mount Google Drive
 # ===============================
 from google.colab import drive
 drive.mount('/content/drive')
 
 
 # ===============================
-# 2⍡ Imports
+# 2║ Imports
 # ===============================
 import os
 import torch
@@ -15,13 +15,16 @@ import pandas as pd
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, AutoModel
 from datasets import Dataset
+from sklearn.model_selection import StratifiedKFold # Updated import
+import numpy as np
+import matplotlib.pyplot as plt
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
 
 
 # ===============================
-# 3⍡ Load Metadata
+# 3║ Load Metadata
 # ===============================
 base_path = "/content/drive/MyDrive/schizophrenia_dataset"
 
@@ -60,6 +63,10 @@ print("Total valid participants:", len(metadata))
 print("\nFirst 5 Participant IDs from metadata:")
 print(metadata['Participant ID'].head())
 
+# Define cl_path and co_path before printing os.listdir(cl_path)
+cl_path = os.path.join(base_path, "Speaker_Only_Raw_CL")
+co_path = os.path.join(base_path, "Speaker_Only_Raw_CO")
+
 print("\nFirst 5 files in CL folder:")
 print(os.listdir(cl_path)[:5])
 
@@ -67,10 +74,8 @@ print(os.listdir(cl_path)[:5])
 
 
 # ===============================
-# 4⍡ Load Transcript Files
+# 4║ Load Transcript Files
 # ===============================
-cl_path = os.path.join(base_path, "Speaker_Only_Raw_CL")
-co_path = os.path.join(base_path, "Speaker_Only_Raw_CO")
 print("First 5 transcript files in CL:")
 print(os.listdir(cl_path)[:5])
 
@@ -97,22 +102,72 @@ for _, row in metadata.iterrows():
 print("Total loaded transcripts:", len(texts))
 
 
-from sklearn.model_selection import LeaveOneOut
-import numpy as np
+# ===============================
+# Tokenization Function (moved here for scope)
+# ===============================
+tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
 
-loo = LeaveOneOut()
+def tokenize(batch):
+    return tokenizer(
+        batch["text"],
+        padding="max_length",
+        truncation=True,
+        max_length=256
+    )
+
+# ===============================
+# Dual Linguistic Model Definition (Updated)
+# ===============================
+class DualLinguisticModel(nn.Module):
+    def __init__(self, bert_model, electra_model):
+        super().__init__()
+        self.bert = bert_model
+        self.electra = electra_model
+
+        # Classifier takes concatenated output of BERT and ELECTRA (768 + 768 = 1536)
+        self.classifier = nn.Sequential(
+            nn.Linear(1536, 256),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(256, 2)
+        )
+
+    def forward(self, input_ids, attention_mask):
+        # Removed torch.no_grad() to allow fine-tuning of unfrozen layers
+        bert_outputs = self.bert(
+            input_ids=input_ids,
+            attention_mask=attention_mask
+        )
+        electra_outputs = self.electra(
+            input_ids=input_ids,
+            attention_mask=attention_mask
+        )
+
+        bert_cls_embedding = bert_outputs.last_hidden_state[:, 0, :]
+        electra_cls_embedding = electra_outputs.last_hidden_state[:, 0, :]
+
+        # Concatenate the embeddings
+        combined_embedding = torch.cat((bert_cls_embedding, electra_cls_embedding), dim=1)
+
+        return self.classifier(combined_embedding)
+
+
+# ===============================
+# Cross-Validation Setup (Updated for Stratified K-Fold)
+# ===============================
+skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42) # Replaced LeaveOneOut with StratifiedKFold
 
 all_accuracies = []
 
-texts = np.array(texts)
-labels = np.array(labels)
+texts_np = np.array(texts)
+labels_np = np.array(labels)
 
-for fold, (train_index, test_index) in enumerate(loo.split(texts)):
+for fold_idx, (train_index, test_index) in enumerate(skf.split(texts_np, labels_np)):
 
-    print(f"\nFold {fold+1}/{len(texts)}")
+    print(f"\nFold {fold_idx+1}/{skf.get_n_splits()}")
 
-    train_texts, test_texts = texts[train_index], texts[test_index]
-    train_labels, test_labels = labels[train_index], labels[test_index]
+    train_texts, test_texts = texts_np[train_index], texts_np[test_index]
+    train_labels, test_labels = labels_np[train_index], labels_np[test_index]
 
     # Create HF dataset
     train_dataset = Dataset.from_dict({
@@ -144,7 +199,8 @@ for fold, (train_index, test_index) in enumerate(loo.split(texts)):
     for param in electra.parameters():
         param.requires_grad = False
 
-    for i in range(8, 12):
+    # Unfreeze layers 4-11 (updated fine-tuning)
+    for i in range(4, 12): # Changed from 6 to 4
         for param in bert.encoder.layer[i].parameters():
             param.requires_grad = True
         for param in electra.encoder.layer[i].parameters():
@@ -172,7 +228,7 @@ for fold, (train_index, test_index) in enumerate(loo.split(texts)):
     optimizer = torch.optim.Adam(optimizer_grouped_parameters)
 
     # Train for few epochs (keep small to reduce overfitting)
-    for epoch in range(4):
+    for epoch in range(8): # Changed from 4 to 8
         model.train()
         for batch in train_loader:
             input_ids = batch["input_ids"].to(device)
@@ -208,4 +264,15 @@ for fold, (train_index, test_index) in enumerate(loo.split(texts)):
     print("Fold Accuracy:", fold_accuracy)
 
 
-print("\nFinal LOOCV Accuracy:", np.mean(all_accuracies))
+print("\nFinal Stratified 5-Fold CV Accuracy (Improved Model):", np.mean(all_accuracies))
+
+# Visualize the new performance
+plt.figure(figsize=(10, 6))
+plt.bar(range(1, len(all_accuracies) + 1), all_accuracies, color='skyblue')
+plt.xlabel('Fold Number')
+plt.ylabel('Accuracy')
+plt.title('Stratified 5-Fold Cross-Validation Accuracies (Improved Model)')
+plt.ylim(0, 1)
+plt.xticks(range(1, len(all_accuracies) + 1))
+plt.grid(axis='y', linestyle='--')
+plt.show()
